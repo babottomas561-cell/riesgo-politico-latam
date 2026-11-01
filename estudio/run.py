@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from eventos import EVENTOS  # noqa: E402
 
 from quantkit import events, style  # noqa: E402
-from quantkit.data import load_prices  # noqa: E402
+from quantkit.data import load_data912, load_prices  # noqa: E402
 
 HERE = Path(__file__).parent
 FIG = HERE / "figures"
@@ -42,6 +42,8 @@ LULA = "2026-10-26"
 PRIMERA_VUELTA_BR = "2026-10-05"
 SECTORES = {"Bancos": ["GGAL", "BMA", "BBAR", "SUPV"], "Energía": ["YPF", "PAM", "CEPU", "TGS"],
             "Servicios": ["EDN", "TEO"], "Agro e inmuebles": ["CRESY", "IRS", "LOMA"]}
+BONOS = ["GD30D", "GD35D", "GD41D"]          # Globales en dólares MEP: corto, medio, largo (data912/BYMA)
+PARES = {"EWW": "México", "ECH": "Chile", "EPU": "Perú", "COLO": "Colombia", "EEM": "Emergentes"}
 SHOCK_BR = 2.5                               # un "día grande" de Brasil: |shock propio| > 2,5 desvíos
 C_AR, C_BR, C_US = style.BLUE, style.AQUA, style.ORANGE
 
@@ -58,6 +60,22 @@ def load() -> tuple[pd.DataFrame, pd.DataFrame]:
     r["^TNX"] = p["^TNX"].diff() / 100      # cambio de rendimiento, en decimales
     r["AR"] = r[AR].mean(axis=1)            # canasta equiponderada de ADRs argentinos
     return p, r.iloc[1:]
+
+
+def load_extra(p: pd.DataFrame, r: pd.DataFrame) -> pd.DataFrame:
+    """Bonos soberanos y pares de LatAm, en el mismo calendario que ``load``.
+
+    Se cargan aparte para no cambiar el panel congelado del estudio original. Los bonos
+    pagan cupón y amortización el 9/1 y el 9/7: el precio cae en la fecha ex, sin que
+    cambie el riesgo. Esas semanas se excluyen (ninguna cae en el período de la caída)."""
+    peers = load_prices(list(PARES) + ["SPY"], start=START, end=END, how="all").drop(columns="SPY")
+    ext = pd.concat([peers, load_data912(BONOS)], axis=1).reindex(p.index).ffill()
+    rx = np.log(ext).diff().reindex(r.index)
+    ex = rx.index.month.isin([1, 7]) & (rx.index.day >= 5) & (rx.index.day <= 12)
+    rx.loc[ex, BONOS] = np.nan
+    rx["Bonos"] = rx[BONOS].mean(axis=1, skipna=False)
+    rx["LatAm sin Brasil"] = rx[["EWW", "ECH", "EPU", "COLO"]].mean(axis=1)
+    return pd.concat([r, rx], axis=1)
 
 
 def brazil_factor(r: pd.DataFrame, est: tuple[str, str]) -> pd.Series:
@@ -78,9 +96,13 @@ def event_table(r: pd.DataFrame) -> pd.DataFrame:
     for e in EVENTOS:
         a = events.event_car(r["AR"], r[GLOBAL], e.dia0, WINDOW)
         b = events.event_car(r["EWZ"], r[GLOBAL], e.dia0, WINDOW)
-        rows.append({"Fecha": e.dia0, "País": e.pais, "Evento": e.nombre,
-                     "Argentina CAR": a["car"], "Argentina t": a["t"], "Argentina p emp": a["p_emp"],
-                     "Brasil CAR": b["car"], "Brasil t": b["t"], "Brasil p emp": b["p_emp"]})
+        row = {"Fecha": e.dia0, "País": e.pais, "Evento": e.nombre,
+               "Argentina CAR": a["car"], "Argentina t": a["t"], "Argentina p emp": a["p_emp"],
+               "Brasil CAR": b["car"], "Brasil t": b["t"], "Brasil p emp": b["p_emp"]}
+        if "Bonos" in r:
+            c = events.event_car(r["Bonos"], r[GLOBAL], e.dia0, WINDOW)
+            row.update({"Bonos CAR": c["car"], "Bonos t": c["t"], "Bonos p emp": c["p_emp"]})
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -106,6 +128,75 @@ def lula_cross_section(r: pd.DataFrame) -> pd.DataFrame:
                      "ret_lula": np.expm1(r.loc[LULA, t]),
                      "grupo": "Brasil" if t in BR_STOCKS else ("MELI" if t == "MELI" else "Argentina")})
     return pd.DataFrame(rows).set_index("ticker")
+
+
+def attribution_of(r: pd.DataFrame, y: str, extra: list[str] | None = None) -> tuple[pd.Series, events.FactorFit]:
+    """Atribución de cualquier serie con los betas de la ventana base (opcionalmente con factores extra)."""
+    X = factors(r, EST) if not extra else pd.concat([factors(r, EST), r[extra]], axis=1)
+    idx = r.loc[EST[0]:EST[1]].index
+    fit = events.fit_factor_model(r[y].loc[idx], X.loc[idx])
+    return events.attribute(r[y], X, fit, r.loc[CAIDA[0]:CAIDA[1]].index), fit
+
+
+def placebo(r: pd.DataFrame) -> pd.DataFrame:
+    """El mismo método aplicado a otros países. Si también les diera un componente propio
+    grande y negativo, el resultado argentino sería un artefacto del método."""
+    rows = {}
+    for t, name in {"AR": "Argentina (ADRs)", "Bonos": "Argentina (bonos)", **PARES}.items():
+        a, fit = attribution_of(r, t)
+        rows[name] = {"Mundo": a[GLOBAL].sum(), "Brasil": a["Brasil"], "Propio": a["idiosincrático"],
+                      "total": a["total"], "beta Brasil": fit.betas["Brasil"], "R²": fit.r2}
+    return pd.DataFrame(rows).T
+
+
+def bootstrap_bands(r: pd.DataFrame) -> pd.DataFrame:
+    """Intervalos de 95% re-estimando también el factor Brasil (bootstrap por bloques)."""
+    est, period = r.loc[EST[0]:EST[1]].index, r.loc[CAIDA[0]:CAIDA[1]].index
+    out = {}
+    for y in ["AR", "Bonos"]:
+        b = events.two_stage_bootstrap(r[y], r["EWZ"], r[GLOBAL], est, period, n_boot=5000)
+        out[y] = b.quantile([0.025, 0.5, 0.975]).T.assign(
+            **{"P(propio < 50%)": [np.nan, np.nan, float((b["propio"] > b.sum(axis=1) / 2).mean())]})
+    return pd.concat(out)
+
+
+def concentration(r: pd.DataFrame) -> dict:
+    """¿El componente argentino vino de pocos días o fue un goteo?"""
+    X = factors(r, EST)
+    idx, period = r.loc[EST[0]:EST[1]].index, r.loc[CAIDA[0]:CAIDA[1]].index
+    fit = events.fit_factor_model(r["AR"].loc[idx], X.loc[idx])
+    d = (r["AR"] - X @ fit.betas).loc[period].sort_values()   # el alfa queda adentro, como en attribute
+    return {"total": d.sum(), "peores5": d[:5].sum(), "peores10": d[:10].sum(), "mejores10": d[-10:].sum(),
+            "peor": d.iloc[0], "peor_dia": d.index[0], "sd": fit.resid_std,
+            "dias_2sd": int((d < -2 * fit.resid_std).sum()), "neg": float((d < 0).mean()), "n": len(d)}
+
+
+def passthrough_by_size(r: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Traspaso de Brasil a Argentina según el tamaño del shock brasileño, y la interacción
+    de ``big_brazil_days`` con distintos umbrales."""
+    br = brazil_factor(r, EST)
+    sd = br.loc[EST[0]:EST[1]].std()
+    sample = r.index.difference(r.loc[LULA:].index[:2])
+    g = events.fit_factor_model(r["AR"].loc[sample], r[GLOBAL].loc[sample])
+    ar_abn = (r["AR"] - g.alpha - r[GLOBAL] @ g.betas).loc[sample]
+    size = (br.loc[sample].abs() / sd)
+    bins = pd.cut(size, [0, 1, 2, 3, np.inf], labels=["< 1", "1 a 2", "2 a 3", "> 3"], right=False)
+    rows = {}
+    for b in bins.cat.categories:
+        x, y = br.loc[sample][bins == b], ar_abn[bins == b]
+        beta = float(x @ y / (x @ x))
+        se = float(np.sqrt(((y - beta * x) ** 2).sum() / (len(x) - 1) / (x @ x)))
+        rows[b] = {"días": len(x), "traspaso": beta, "ee": se}
+    by_size = pd.DataFrame(rows).T
+    thr = {}
+    for k in [2.0, 2.5, 3.0]:
+        big = (br.abs() > k * sd).astype(float)
+        X = pd.concat([r[GLOBAL], br, (br * big).rename("int")], axis=1)
+        f = events.fit_factor_model(r["AR"].loc[sample], X.loc[sample])
+        se = np.sqrt(np.diag(f.cov))[-1]
+        thr[f"{k} desvíos"] = {"días grandes": int(big.loc[sample].sum()), "beta normal": f.betas["Brasil"],
+                               "diferencia": f.betas["int"], "t": f.betas["int"] / se}
+    return by_size, pd.DataFrame(thr).T
 
 
 def sector_attribution(r: pd.DataFrame) -> pd.DataFrame:
@@ -339,6 +430,45 @@ def fig_sectors(sec: pd.DataFrame) -> None:
     style.save(fig, FIG / "07_sectores.png")
 
 
+def fig_placebo(pl: pd.DataFrame) -> None:
+    pl = pl.sort_values("Propio")
+    y = np.arange(len(pl))
+    fig, ax = plt.subplots(figsize=(10, 5))
+    colors = [C_AR if n.startswith("Argentina") else style.MUTED for n in pl.index]
+    ax.barh(y, pl["Propio"] * 100, color=colors, height=0.62)
+    for yi, v in zip(y, pl["Propio"] * 100):
+        ax.text(v + (0.6 if v >= 0 else -0.6), yi, f"{v:+.0f}", va="center", ha="left" if v >= 0 else "right",
+                fontsize=10)
+    ax.set_yticks(y, pl.index)
+    ax.axvline(0, color=style.BASELINE, lw=1)
+    ax.set_xlim(-28, 18)
+    ax.set_xlabel("Componente propio del 15/7 al 30/10/2026 (puntos log, neto de mundo y Brasil)")
+    ax.grid(axis="y", visible=False)
+    ax.set_title("El mismo método, aplicado a los vecinos, no encuentra nada parecido", pad=26)
+    style.subtitle(ax, "Solo Argentina tiene un componente propio grande y negativo, en acciones y en bonos")
+    style.source(fig, "Bonos: GD30D, GD35D y GD41D en dólares MEP (data912/BYMA). Pares: ETFs MSCI de cada país.")
+    style.save(fig, FIG / "08_placebo.png")
+
+
+def fig_passthrough(by_size: pd.DataFrame) -> None:
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    x = np.arange(len(by_size))
+    ax.bar(x, by_size["traspaso"], color=C_BR, width=0.6)
+    ax.errorbar(x, by_size["traspaso"], yerr=1.96 * by_size["ee"], fmt="none", ecolor=style.INK_2, capsize=4, lw=1)
+    for xi, (v, n) in enumerate(zip(by_size["traspaso"], by_size["días"])):
+        ax.text(xi, 0.03, f"{v:.2f}\n{int(n)} días", ha="center", va="bottom", fontsize=9.5, color=style.SURFACE,
+                fontweight="bold")
+    ax.set_xticks(x, [f"{b} desvíos" for b in by_size.index])
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Tamaño del shock propio de Brasil ese día")
+    ax.set_ylabel("Traspaso a los ADRs argentinos")
+    ax.grid(axis="x", visible=False)
+    ax.set_title("Con shocks más grandes de Brasil, Argentina acompaña algo menos", pad=26)
+    style.subtitle(ax, "Tendencia, no prueba: los intervalos de 95% se superponen. Pendiente de los ADRs (netos del "
+                       "mundo) sobre el shock de Brasil")
+    style.save(fig, FIG / "09_traspaso_por_tamano.png")
+
+
 # ============================================================================ main
 
 def pct(x: float) -> str:
@@ -348,6 +478,7 @@ def pct(x: float) -> str:
 def main() -> None:
     style.apply()
     p, r = load()
+    r = load_extra(p, r)
     tab = event_table(r)
     attr, fit = attribution(r, EST)
     robust = pd.DataFrame({f"{a} a {b}": attribution(r, (a, b))[0] for a, b in [EST] + EST_ALT}).T
@@ -367,6 +498,14 @@ def main() -> None:
     rho, rho_p = stats.pearsonr(ar_cs["beta_brasil"], ar_cs["ret_lula"])
     pt = lula_passthrough(cs, r)
     big_coefs, big_days = big_brazil_days(r)
+    pl = placebo(r)
+    bands = bootstrap_bands(r)
+    conc = concentration(r)
+    by_size, thr = passthrough_by_size(r)
+    bond_attr = pd.DataFrame({t: attribution_of(r, t)[0] for t in ["Bonos"] + BONOS}).T
+    robust_f = pd.DataFrame({"Base": attribution_of(r, "AR")[0],
+                             "+ Emergentes (EEM)": attribution_of(r, "AR", ["EEM"])[0],
+                             "+ LatAm sin Brasil": attribution_of(r, "AR", ["LatAm sin Brasil"])[0]}).T
 
     fig_trajectory(p)
     fig_events(tab)
@@ -375,6 +514,8 @@ def main() -> None:
     fig_waterfall(attr)
     fig_path(path)
     fig_sectors(sec)
+    fig_placebo(pl)
+    fig_passthrough(by_size)
 
     cum = lambda cols, a, b: np.expm1(r.loc[a:b, cols].sum())  # noqa: E731
     lines = ["# Resultados (generado por estudio/run.py)", "",
@@ -386,8 +527,10 @@ def main() -> None:
              .map(pct).to_markdown(), "",
              "## Eventos: retorno anormal acumulado [0, +1]", "",
              tab.assign(**{c: tab[c].map(pct) for c in ["Argentina CAR", "Brasil CAR"]},
-                        **{c: tab[c].round(1) for c in ["Argentina t", "Brasil t"]},
-                        **{c: tab[c].round(3) for c in ["Argentina p emp", "Brasil p emp"]}).to_markdown(index=False),
+                        **{c: tab[c].map(pct) for c in ["Bonos CAR"]},
+                        **{c: tab[c].round(1) for c in ["Argentina t", "Brasil t", "Bonos t"]},
+                        **{c: tab[c].round(3) for c in ["Argentina p emp", "Brasil p emp", "Bonos p emp"]})
+             .to_markdown(index=False),
              "", "p emp = fracción de ventanas de 2 días de la ventana de estimación con un residuo al menos igual.", "",
              "## Atribución de la caída desde el 15/7/2026 (puntos log)", "",
              f"Betas: {fit.betas.round(2).to_dict()}, R² {fit.r2:.2f}, {fit.n} ruedas.", "",
@@ -398,6 +541,15 @@ def main() -> None:
              f"caída) = {share_p:.3f}. Contra ruido normal ({band['sd_noise'] * 100:.1f} pts en {len(period)} ruedas): "
              f"z = {attr['idiosincrático'] / band['sd_noise']:.1f}. Ventanas de {len(period)} ruedas desde 2023 con un componente "
              f"argentino igual o peor: {freq:.1%} (peor: {roll.min() * 100:.1f}, el {roll.idxmin().date()}).", "",
+             "### Bootstrap en dos etapas (re-estima también el factor Brasil; 5000 réplicas, bloques de 10)", "",
+             (bands * 100).round(1).rename(columns={"P(propio < 50%)": "P(propio < 50%) x100"}).to_markdown(), "",
+             "### Robustez a factores adicionales (AR)", "",
+             (robust_f * 100).round(1).to_markdown(), "",
+             "### Concentración del componente argentino", "",
+             f"Total {conc['total'] * 100:.1f}; 5 peores días {conc['peores5'] * 100:.1f}; 10 peores "
+             f"{conc['peores10'] * 100:.1f}; 10 mejores {conc['mejores10'] * 100:+.1f}. Peor día "
+             f"{conc['peor'] * 100:.1f}% ({conc['peor_dia'].date()}). Días por debajo de -2 desvíos "
+             f"({2 * conc['sd'] * 100:.1f}%): {conc['dias_2sd']} de {conc['n']}. Días negativos: {conc['neg']:.0%}.", "",
              "### Trayectoria del componente argentino", "",
              f"Acumulado al 2/10 (antes de la 1ª vuelta brasileña): "
              f"{path['idiosincrático'].loc[:'2026-10-02'].iloc[-1] * 100:.1f} pts; al 23/10 (antes del balotaje): "
@@ -406,6 +558,10 @@ def main() -> None:
              f"final {path['Brasil'].iloc[-1] * 100:.1f}.", "",
              "### Por sector (puntos log)", "",
              (sec * 100).round(1).to_markdown(), "",
+             "## Bonos soberanos (puntos log)", "",
+             (bond_attr * 100).round(1).to_markdown(), "",
+             "## Placebo: el mismo método en otros países (puntos log)", "",
+             pl.assign(**{c: pl[c] * 100 for c in ["Mundo", "Brasil", "Propio", "total"]}).round(2).to_markdown(), "",
              "## Reelección de Lula: corte transversal", "",
              cs.assign(ret_lula=cs["ret_lula"].map(pct), beta_brasil=cs["beta_brasil"].round(2))
              .sort_values("beta_brasil").to_markdown(), "",
@@ -416,6 +572,8 @@ def main() -> None:
              f"Regresión de AR sobre mundo + Brasil + Brasil x (|shock| > {SHOCK_BR} desvíos), toda la muestra "
              "sin el 26-27/10/2026.", "",
              big_coefs.round(2).to_markdown(), "",
+             "Por umbral:", "", thr.round(2).to_markdown(), "",
+             "Traspaso por tamaño del shock (pendiente sin constante):", "", by_size.round(3).to_markdown(), "",
              "Los 10 días con mayor shock propio de Brasil (log):", "",
              big_days.assign(Brasil=big_days["Brasil"].map(pct), Argentina=big_days["Argentina"].map(pct),
                              traspaso=big_days["traspaso"].round(2)).to_markdown(), "",

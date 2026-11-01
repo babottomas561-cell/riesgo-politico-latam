@@ -78,3 +78,36 @@ def test_attribution_path_ends_at_attribution():
     path = events.attribute_path(y, X, fit, IDX[400:450])
     parts = events.attribute(y, X, fit, IDX[400:450])
     assert path.iloc[-1].to_dict() == pytest.approx(parts.drop("total").to_dict())
+
+
+def _two_stage_world(rng):
+    G = pd.DataFrame(rng.standard_normal((len(IDX), 2)) * 0.01, index=IDX, columns=["mkt", "oil"])
+    reg = pd.Series(rng.standard_normal(len(IDX)) * 0.01, index=IDX)        # Brazil's own shock
+    z = G @ np.array([1.0, 0.3]) + reg
+    y = G @ np.array([1.2, 0.0]) + 0.6 * reg + rng.standard_normal(len(IDX)) * 0.01
+    period = IDX[450:530]
+    y.loc[period] -= 0.10 / len(period)                                     # plant -10 points of own drift
+    truth = float((y - G @ np.array([1.2, 0.0]) - 0.6 * reg).loc[period].sum())
+    return y, z, G, period, truth
+
+
+def test_two_stage_bootstrap_band_covers_the_true_own_component():
+    # A 95% band should cover the truth in most worlds (not every one: that is what 95% means).
+    rng = np.random.default_rng(7)
+    hits = 0
+    for _ in range(20):
+        y, z, G, period, truth = _two_stage_world(rng)
+        lo, hi = events.two_stage_bootstrap(y, z, G, IDX[100:400], period, n_boot=200,
+                                            seed=int(rng.integers(1e6)))["propio"].quantile([0.025, 0.975])
+        hits += lo < truth < hi
+    assert hits >= 16
+
+
+def test_two_stage_band_is_wider_than_treating_the_factor_as_data():
+    y, z, G, period, _ = _two_stage_world(np.random.default_rng(8))
+    est = IDX[100:400]
+    f1 = events.fit_factor_model(z.loc[est], G.loc[est])
+    X = pd.concat([G, (z - f1.alpha - G @ f1.betas).rename("reg")], axis=1)
+    one_stage = events.attribution_band(X, events.fit_factor_model(y.loc[est], X.loc[est]), period)
+    boot = events.two_stage_bootstrap(y, z, G, est, period, n_boot=400)
+    assert boot["propio"].std() > one_stage["sd_betas"]

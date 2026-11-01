@@ -68,3 +68,27 @@ def load_panel(tickers: list[str], start: str = "2000-01-01", end: str | None = 
     """Open/High/Low/Close panels for many tickers, keeping each ticker's own history."""
     return {f: load_prices(tickers, start, end, field=f, adjusted=adjusted, how="all")
             for f in ["Open", "High", "Low", "Close"]}
+
+
+def load_data912(tickers: list[str], kind: str = "bonds", field: str = "c") -> pd.DataFrame:
+    """Daily closes from data912.com (BYMA prices), frozen to ``data/`` like ``load_prices``.
+
+    Used for Argentine sovereign bonds, which Yahoo does not carry. The ``D`` tickers
+    (GD30D, GD35D...) are quoted in dollars (MEP), so they compare directly with ADRs."""
+    key = f"data912|{kind}|{','.join(sorted(tickers))}|{field}"
+    path = DATA_DIR / f"data912_{kind}_{hashlib.sha1(key.encode()).hexdigest()[:10]}.csv"
+    if path.exists():
+        return pd.read_csv(path, index_col=0, parse_dates=True)[tickers]
+
+    import requests
+
+    cols = {}
+    for t in tickers:
+        resp = requests.get(f"https://data912.com/historical/{kind}/{t}", timeout=30)
+        resp.raise_for_status()
+        d = pd.DataFrame(resp.json())
+        cols[t] = d.assign(date=pd.to_datetime(d["date"])).set_index("date")[field].sort_index()
+    prices = pd.DataFrame(cols)
+    DATA_DIR.mkdir(exist_ok=True)
+    prices.to_csv(path)
+    return prices

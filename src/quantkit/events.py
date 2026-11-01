@@ -119,3 +119,31 @@ def rolling_beta(y: pd.Series, x: pd.Series, controls: pd.DataFrame | None, wind
         w = df.iloc[end - window:end]
         out[w.index[-1]] = fit_factor_model(w["_y"], w[X.columns]).betas["x"]
     return pd.Series(out)
+
+
+def two_stage_bootstrap(y: pd.Series, z: pd.Series, G: pd.DataFrame, est: pd.DatetimeIndex,
+                        period: pd.DatetimeIndex, n_boot: int = 2000, block: int = 10,
+                        seed: int = 0) -> pd.DataFrame:
+    """Attribution of y over ``period`` with both estimation stages resampled.
+
+    Stage 1: the regional factor is z's residual on the global factors G. Stage 2: y on G
+    plus that factor. ``attribution_band`` treats the factor as data; here it is
+    re-estimated in every draw, so its own estimation error enters the band. Days of the
+    estimation window are resampled in moving blocks of ``block`` days to keep
+    volatility clusters together. Returns one row per draw: global, regional, own."""
+    df = pd.concat([y.rename("_y"), z.rename("_z"), G], axis=1).loc[est].dropna()
+    Gp, zp, yp = G.loc[period].to_numpy(), z.loc[period].to_numpy(), y.loc[period].to_numpy()
+    T, rng = len(df), np.random.default_rng(seed)
+    A_all = np.column_stack([np.ones(T), df[G.columns].to_numpy()])
+    zs, ys = df["_z"].to_numpy(), df["_y"].to_numpy()
+    rows = []
+    for _ in range(n_boot):
+        starts = rng.integers(0, T - block + 1, size=-(-T // block))
+        i = (starts[:, None] + np.arange(block)).ravel()[:T]
+        c1, *_ = np.linalg.lstsq(A_all[i], zs[i], rcond=None)
+        f_est = zs[i] - A_all[i] @ c1
+        f_per = zp - c1[0] - Gp @ c1[1:]
+        c2, *_ = np.linalg.lstsq(np.column_stack([A_all[i], f_est]), ys[i], rcond=None)
+        glob, reg = float((Gp.sum(axis=0) @ c2[1:-1])), float(f_per.sum() * c2[-1])
+        rows.append({"global": glob, "regional": reg, "propio": float(yp.sum()) - glob - reg})
+    return pd.DataFrame(rows)
