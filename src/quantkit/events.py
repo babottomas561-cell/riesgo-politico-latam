@@ -21,6 +21,7 @@ class FactorFit:
     resid_std: float
     r2: float
     n: int
+    cov: np.ndarray | None = None   # covariance of the betas (intercept excluded)
 
 
 def fit_factor_model(y: pd.Series, X: pd.DataFrame) -> FactorFit:
@@ -31,9 +32,10 @@ def fit_factor_model(y: pd.Series, X: pd.DataFrame) -> FactorFit:
     resid = df["_y"].to_numpy() - A @ coef
     dof = len(df) - A.shape[1]
     ss_tot = ((df["_y"] - df["_y"].mean()) ** 2).sum()
+    s2 = resid @ resid / dof
+    cov = s2 * np.linalg.inv(A.T @ A)[1:, 1:]
     return FactorFit(alpha=coef[0], betas=pd.Series(coef[1:], index=X.columns),
-                     resid_std=float(np.sqrt(resid @ resid / dof)),
-                     r2=float(1 - resid @ resid / ss_tot), n=len(df))
+                     resid_std=float(np.sqrt(s2)), r2=float(1 - resid @ resid / ss_tot), n=len(df), cov=cov)
 
 
 def estimation_window(index: pd.DatetimeIndex, day0: pd.Timestamp, length: int = 250, gap: int = 10) -> pd.DatetimeIndex:
@@ -51,7 +53,11 @@ def estimation_window(index: pd.DatetimeIndex, day0: pd.Timestamp, length: int =
 def event_car(y: pd.Series, X: pd.DataFrame, day0: str | pd.Timestamp, window: tuple[int, int] = (0, 1),
               est_length: int = 250, gap: int = 10) -> dict[str, float]:
     """Cumulative abnormal return over trading days [window[0], window[1]] around day 0,
-    with a t-statistic from the estimation-window residual volatility (Brown & Warner, 1985)."""
+    with a t-statistic from the estimation-window residual volatility (Brown & Warner, 1985).
+
+    ``p_emp`` drops the normality assumption: the share of all same-length windows inside
+    the estimation sample whose summed residual is at least as large in absolute value.
+    Fat tails (common in Argentine ADRs) make it larger than the normal ``p``."""
     day0 = pd.Timestamp(day0)
     idx = y.dropna().index.intersection(X.dropna().index)
     est = estimation_window(idx, day0, est_length, gap)
@@ -63,8 +69,11 @@ def event_car(y: pd.Series, X: pd.DataFrame, day0: str | pd.Timestamp, window: t
     n = len(days)
     car = float(ar.sum())
     t = car / (fit.resid_std * np.sqrt(n))
+    resid = y.loc[est] - fit.alpha - X.loc[est] @ fit.betas
+    placebo = resid.rolling(n).sum().dropna()
     return {"raw": float(y.loc[days].sum()), "expected": float(expected.sum()), "car": car,
-            "t": t, "p": float(2 * stats.norm.sf(abs(t))), "days": n}
+            "t": t, "p": float(2 * stats.norm.sf(abs(t))),
+            "p_emp": float((placebo.abs() >= abs(car)).mean()), "days": n}
 
 
 def attribute(y: pd.Series, X: pd.DataFrame, fit: FactorFit, period: pd.DatetimeIndex) -> pd.Series:
@@ -80,6 +89,25 @@ def attribute(y: pd.Series, X: pd.DataFrame, fit: FactorFit, period: pd.Datetime
     out["idiosincrático"] = total - contrib.sum()
     out["total"] = total
     return out
+
+
+def attribution_band(X: pd.DataFrame, fit: FactorFit, period: pd.DatetimeIndex) -> dict[str, float]:
+    """Two sources of uncertainty in the unexplained remainder of ``attribute``.
+
+    ``sd_betas``: from estimating the betas. Since total is observed, the remainder moves
+    one-for-one (with opposite sign) with the explained part, whose variance is
+    s' Cov(beta) s for s = summed factor returns. It says how sure we are of the split.
+    ``sd_noise``: how large a remainder ordinary residual noise produces over that many
+    days (sigma * sqrt(n)). Remainder / sd_noise tests whether it is abnormal at all."""
+    s = X.loc[period].sum().to_numpy()
+    return {"sd_betas": float(np.sqrt(s @ fit.cov @ s)), "sd_noise": fit.resid_std * np.sqrt(len(period))}
+
+
+def attribute_path(y: pd.Series, X: pd.DataFrame, fit: FactorFit, period: pd.DatetimeIndex) -> pd.DataFrame:
+    """Cumulative version of ``attribute``, day by day: when each contribution built up."""
+    contrib = X.loc[period] * fit.betas
+    contrib["idiosincrático"] = y.loc[period] - contrib.sum(axis=1)
+    return contrib.cumsum()
 
 
 def rolling_beta(y: pd.Series, x: pd.Series, controls: pd.DataFrame | None, window: int = 120) -> pd.Series:

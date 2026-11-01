@@ -55,3 +55,26 @@ def test_rolling_beta_tracks_a_regime_change():
     rb = events.rolling_beta(y, x, None, window=120)
     assert rb.iloc[0] == pytest.approx(0.2, abs=0.15)
     assert rb.iloc[-1] == pytest.approx(1.0, abs=0.15)
+
+
+def test_empirical_p_is_small_for_planted_shock_and_large_for_none():
+    y, X = synthetic()
+    day0 = IDX[500]
+    assert events.event_car(y, X, day0, window=(0, 1))["p_emp"] > 0.01
+    y.loc[day0] -= 0.10
+    assert events.event_car(y, X, day0, window=(0, 1))["p_emp"] < 0.01
+
+
+def test_beta_covariance_matches_monte_carlo_spread():
+    # The analytical sd of the betas should match their spread across fresh samples.
+    draws = [events.fit_factor_model(*synthetic()).betas["mkt"] for _ in range(300)]
+    sd_analytic = np.sqrt(events.fit_factor_model(*synthetic()).cov[0, 0])
+    assert np.std(draws) == pytest.approx(sd_analytic, rel=0.2)
+
+
+def test_attribution_path_ends_at_attribution():
+    y, X = synthetic()
+    fit = events.fit_factor_model(y.iloc[:400], X.iloc[:400])
+    path = events.attribute_path(y, X, fit, IDX[400:450])
+    parts = events.attribute(y, X, fit, IDX[400:450])
+    assert path.iloc[-1].to_dict() == pytest.approx(parts.drop("total").to_dict())
